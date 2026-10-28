@@ -1,1 +1,2 @@
 match_id,fight_id,map_name,map_mode,side,fight_start_sec,fight_end_sec,team_comp,enemy_comp,team_ults_ready,enemy_ults_ready,team_alive,enemy_alive,fight_won,annotation_confidence,notes
+"UT_001","1","Ilios","Control","NA","46","59","Orisa; Cassidy; Tracer; Ana; Kiriko","D.VA; Cassidy; Vendetta; Doctrine; Sombra","0","0","5","5","0","high","everyone on UT dead except Orisa. Killed their Vendetta"
