@@ -1,2 +1,1 @@
-match_id,fight_id,map_name,map_mode,side,fight_start_sec,team_ults_ready,enemy_ults_ready,team_alive,enemy_alive,fight_won,notes
-
+match_id,fight_id,map_name,map_mode,side,fight_start_sec,fight_end_sec,team_comp,enemy_comp,team_ults_ready,enemy_ults_ready,team_alive,enemy_alive,fight_won,annotation_confidence,notes
