@@ -1,74 +1,187 @@
-import csv, random, sqlite3
+"""Run provenance-separated Pandas / SQLite / Matplotlib exploratory analysis."""
+import argparse
+import hashlib
+import json
+import os
+import platform
+import sqlite3
+import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-REAL = ROOT / 'data/real/teamfights.csv'
-SYN = ROOT / 'data/synthetic/teamfights_simulated.csv'
-OUT = ROOT / 'output'
-OUT.mkdir(exist_ok=True)
-FIELDS = ['match_id','fight_id','map_name','ult_diff','first_pick','fight_won','fight_duration','data_source','confidence','notes']
+os.environ.setdefault('MPLCONFIGDIR', str(Path(tempfile.gettempdir()) / 'teamfight-matplotlib'))
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import pandas as pd
 
-def load_real():
-    with REAL.open(newline='', encoding='utf-8') as f:
-        rows = list(csv.DictReader(f))
-    problems=[]
-    seen=set()
-    for i,r in enumerate(rows,2):
-        key=(r['match_id'],r['fight_id'])
-        if key in seen: problems.append(f'row {i}: duplicate {key}')
-        seen.add(key)
-        if r['fight_won'] not in ('0','1'): problems.append(f'row {i}: invalid fight_won')
-        if r['ult_diff']:
-            try:
-                if not -5<=int(r['ult_diff'])<=5: problems.append(f'row {i}: ult_diff outside [-5,5]')
-            except ValueError: problems.append(f'row {i}: invalid ult_diff')
-        if r['first_pick'] not in ('UT','Enemy','Unknown'): problems.append(f'row {i}: invalid first_pick')
-        if r['data_source'] not in ('replay','memory'): problems.append(f'row {i}: invalid source')
-        if r['confidence'] not in ('high','medium','low'): problems.append(f'row {i}: invalid confidence')
-        if r['fight_duration']:
-            try:
-                if float(r['fight_duration'])<=0: problems.append(f'row {i}: nonpositive duration')
-            except ValueError: problems.append(f'row {i}: invalid duration')
-    if problems: raise ValueError('\n'.join(problems))
-    return rows
+from data_pipeline import load_real, simulate
+from validate_data import ROOT, validate_analysis
 
-def simulate(n=500, seed=42):
-    rng=random.Random(seed)
-    rows=[]
-    for i in range(n):
-        diff=rng.randint(-3,3)
-        # Assumed probability, NOT estimated from real matches.
-        p=1/(1+2.718281828**(-0.35*diff))
-        win=int(rng.random()<p)
-        rows.append(dict(match_id=f'SIM_{i//10+1:03}',fight_id=str(i%10+1),map_name='Simulated',ult_diff=str(diff),first_pick='Unknown',fight_won=str(win),fight_duration='',data_source='synthetic',confidence='synthetic',notes='Generated under assumed logistic relationship; not observed'))
-    with SYN.open('w',newline='',encoding='utf-8') as f:
-        writer=csv.DictWriter(f,fieldnames=FIELDS);writer.writeheader();writer.writerows(rows)
-    return rows
 
-def summarize(rows, label):
-    db=sqlite3.connect(':memory:')
-    db.execute('CREATE TABLE fights (ult_diff INTEGER, fight_won INTEGER)')
-    db.executemany('INSERT INTO fights VALUES (?,?)',[(int(r['ult_diff']),int(r['fight_won'])) for r in rows if r['ult_diff']!=''])
-    groups=db.execute('SELECT ult_diff,COUNT(*),ROUND(AVG(fight_won)*100,1) FROM fights GROUP BY ult_diff ORDER BY ult_diff').fetchall()
-    db.close()
-    return label,groups
+def markdown_table(frame):
+    def cell(value):
+        if pd.isna(value):
+            return '—'
+        if isinstance(value, float):
+            return f'{value:.3f}'
+        return str(value).replace('|', '\\|').replace('\n', ' ')
+    return '\n'.join(['| ' + ' | '.join(frame.columns) + ' |',
+                      '| ' + ' | '.join(['---'] * len(frame.columns)) + ' |'] +
+                     ['| ' + ' | '.join(cell(x) for x in row) + ' |'
+                      for row in frame.itertuples(index=False, name=None)])
+
+
+def summarize(frame, directory, synthetic=False):
+    """A database never mixes synthetic and real rows; queries retain provenance."""
+    sources = {'synthetic'} if synthetic else {'replay', 'memory'}
+    frame = validate_analysis(frame, sources)
+    directory.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(directory / 'analysis.csv', index=False, lineterminator='\n')
+    database = directory / 'teamfights.sqlite'
+    if database.exists():
+        database.unlink()
+    tables = {}
+    with sqlite3.connect(database) as connection:
+        frame.to_sql('fights', connection, index=False, if_exists='fail', dtype={
+            'ult_diff': 'INTEGER', 'fight_won': 'INTEGER', 'fight_duration': 'REAL'})
+        connection.execute('CREATE UNIQUE INDEX fight_identity ON fights(match_id, fight_id)')
+        for path in sorted((ROOT / 'sql').glob('*.sql')):
+            table = pd.read_sql_query(path.read_text(encoding='utf-8'), connection)
+            tables[path.stem] = table
+            table.to_csv(directory / f'{path.stem}.csv', index=False, lineterminator='\n')
+    title = 'SYNTHETIC DEMONSTRATION — assumed relationship' if synthetic else 'Real observations — descriptive only'
+    lines = [f'# {title}', '', f'Records: **{len(frame)}**. '
+             f'Matches: **{frame.match_id.nunique()}**.', '']
+    if synthetic:
+        lines += ['These are simulated outcomes, not empirical Overwatch win rates. '
+                  'The generator imposes an association; these results cannot validate H1.', '']
+    else:
+        lines += ['Replay and memory observations remain separate below. Replay is the '
+                  'existing annotation label; this pipeline did not independently watch replays. '
+                  'The current real sample is insufficient for significance, causal, '
+                  'population win-rate, or reliable predictive claims.', '']
+        for source in ['replay', 'memory']:
+            observed = frame[frame.data_source.eq(source)]
+            n_known = observed.ult_diff.notna().sum()
+            n_levels = observed.ult_diff.nunique()
+            lines += [f'{source}: N={len(observed)} fights; ultimate difference recorded '
+                      f'for N={n_known}, with {n_levels} distinct recorded values.']
+            if n_levels < 2:
+                lines += ['H1 cannot be evaluated in this source: no variation in recorded ultimate difference.']
+            lines += ['']
+    for name, table in tables.items():
+        lines += [f'## {name.replace("_", " ")}', '', markdown_table(table), '']
+        if table.empty:
+            lines += ['No eligible observations.', '']
+    counts = frame.data_source.value_counts()
+    lines += ['## Coverage and interpretation', '']
+    for source in sorted(sources):
+        lines += [f'- {source}: N={counts.get(source, 0)} annotated fights.']
+    lines += ['', '- Rates use only known outcomes; n_outcomes is their denominator. '
+              'Missing outcomes never become losses.',
+              '- Ultimate differences require both recorded readiness counts. '
+              'Unknown advantages are excluded only from the ultimate grouping.',
+              '- H1 concerns readiness immediately before engagement. Existing timestamps '
+              'need replay audit to establish that timing consistently.',
+              '- First pick occurs during combat. Duration and outcome are measured '
+              'after the fight. These are descriptive variables, not pre-fight predictors.',
+              '- H2 (positioning) and H3 (coordination) remain qualitative: notes are '
+              'retained, with no invented quantitative scores.',
+              '- Fights within matches are correlated; maps, compositions, rank, patch, '
+              'and selection may confound any observed association.',
+              '- No imputation, significance test, causal estimate, or predictive model is used.', '',
+              '![Ultimate economy and outcome](ult_outcomes.png)', '',
+              '![Observation completeness](completeness.png)', '']
+    (directory / 'report.md').write_text('\n'.join(lines), encoding='utf-8')
+    plot_ult(tables['by_ult_diff'], directory, title)
+    plot_completeness(tables['missingness'], directory, title)
+
+
+def plot_ult(table, directory, title):
+    fig, axis = plt.subplots(figsize=(9, 5), layout='constrained')
+    for (source, confidence), group in table.groupby(['data_source', 'confidence'], sort=True):
+        axis.plot(group.ult_diff, group.win_rate, marker='o', label=f'{source}, {confidence}')
+        for row in group.itertuples(index=False):
+            if pd.notna(row.win_rate):
+                axis.annotate(f'n={row.n_outcomes}/{row.n_fights}',
+                              (row.ult_diff, row.win_rate), xytext=(0, 9),
+                              textcoords='offset points', ha='center', fontsize=8)
+    if table.empty:
+        axis.text(.5, .5, 'No known ultimate differences', ha='center', transform=axis.transAxes)
+    else:
+        axis.legend(loc='lower right')
+    axis.set(xlabel='Pre-fight ultimate difference (UT − enemy)', ylabel='Win fraction among known outcomes',
+             ylim=(-.08, 1.18), title=title + '\nLabels: known outcomes / fights in each group')
+    axis.grid(alpha=.2)
+    fig.savefig(directory / 'ult_outcomes.png', dpi=150, metadata={'Software': 'teamfight-analytics'})
+    plt.close(fig)
+
+
+def plot_completeness(table, directory, title):
+    fig, axis = plt.subplots(figsize=(10, 5), layout='constrained')
+    if table.empty:
+        axis.text(.5, .5, 'No observations', ha='center', transform=axis.transAxes)
+    else:
+        labels = [f'{r.data_source}/{r.confidence}\n{r.variable}' for r in table.itertuples()]
+        bars = axis.bar(range(len(table)), table.n_known, color='#287b8e')
+        axis.set_xticks(range(len(table)), labels, rotation=45, ha='right', fontsize=8)
+        for bar, row in zip(bars, table.itertuples()):
+            axis.annotate(f'{row.n_known}/{row.n_fights}',
+                          (bar.get_x() + bar.get_width()/2, bar.get_height()),
+                          ha='center', va='bottom', fontsize=8)
+        axis.set_ylim(0, max(table.n_fights.max() * 1.2, 1))
+    axis.set(ylabel='Known observations (labels: known / all)', title=title)
+    fig.savefig(directory / 'completeness.png', dpi=150, metadata={'Software': 'teamfight-analytics'})
+    plt.close(fig)
+
+
+def run(raw_path, real_path, memory_path, output, seed=42, n=500, raw_source='replay'):
+    output = Path(output)
+    real = load_real(raw_path, real_path, memory_path, raw_source)
+    synthetic = simulate(n, seed)
+    output.mkdir(parents=True, exist_ok=True)
+    summarize(real, output / 'real')
+    summarize(synthetic, output / 'synthetic', synthetic=True)
+    manifest = {
+        'seed': seed, 'synthetic_rows': n, 'raw_source': raw_source,
+        'inputs_sha256': {label: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                          for label, path in [('raw', raw_path), ('legacy_real', real_path),
+                                              ('memory', memory_path)]},
+        'versions': {'python': platform.python_version(), 'pandas': pd.__version__,
+                     'matplotlib': matplotlib.__version__, 'sqlite': sqlite3.sqlite_version},
+    }
+    (output / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    (output / 'report.md').write_text(
+        '# Overwatch teamfight analytics — Phase 1\n\n'
+        f'Real annotations: N={len(real)}; synthetic demonstration: N={len(synthetic)}.\n\n'
+        '- [Real observations and limitations](real/report.md)\n'
+        '- [Synthetic demonstration (assumed relationship)](synthetic/report.md)\n\n'
+        'These populations are never pooled. See manifest.json for seed, input hashes, and runtime versions.\n',
+        encoding='utf-8')
+    return real, synthetic
+
 
 def main():
-    real=load_real()
-    synthetic=simulate()
-    lines=['# Teamfight Analytics — Initial Report','','**Important:** The synthetic results below are a software demonstration, not empirical evidence about Overwatch.','','## Real data','',f'Records: **{len(real)}**.']
-    if real:
-        lines += [f'Observed wins: **{sum(int(r["fight_won"]) for r in real)}/{len(real)}**.','']
-    else: lines += ['No real observations loaded.','']
-    for label,rows in [summarize(real,'Real'),summarize(synthetic,'Synthetic')]:
-        lines += [f'## {label}: ultimate advantage and outcome','','| Ult difference | N | Win rate (%) |','|---:|---:|---:|']
-        if rows:
-            lines += [f'| {diff:+d} | {n} | {rate:.1f} |' for diff,n,rate in rows]
-        else: lines += ['| No observed ult_diff | — | — |']
-        lines.append('')
-    lines += ['## Limitations','','- Real sample is currently too small for reliable statistical inference.','- Observations from one team/match are correlated.','- Memory-based estimates should be separated from replay-verified records.','- First pick happens during the fight; it is not a pre-fight predictor.','- The synthetic generator assumes an effect of ult difference by construction; it cannot validate that effect.']
-    report=OUT/'report.md';report.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--raw', type=Path, default=ROOT / 'data/raw/teamfights_raw.csv')
+    parser.add_argument('--real', type=Path, default=ROOT / 'data/real/teamfights.csv')
+    parser.add_argument('--memory', type=Path, default=ROOT / 'data/real/teamfights_memory.csv')
+    parser.add_argument('--raw-source', choices=['replay', 'memory'], default='replay')
+    parser.add_argument('--output', type=Path, default=ROOT / 'output')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--synthetic-rows', type=int, default=500)
+    args = parser.parse_args()
+    inputs = [args.raw.resolve(), args.real.resolve(), args.memory.resolve()]
+    if any(path.is_relative_to(args.output.resolve()) for path in inputs):
+        parser.error('--output must not contain source inputs')
+    try:
+        real, synthetic = run(args.raw, args.real, args.memory, args.output,
+                              args.seed, args.synthetic_rows, args.raw_source)
+    except (ValueError, OSError) as error:
+        parser.exit(1, f'Analysis failed: {error}\n')
     print(f'Real records: {len(real)}; synthetic records: {len(synthetic)}')
-    print(f'Report: {report}')
+    print(f'Report: {args.output / "report.md"}')
 
-if __name__=='__main__':main()
+
+if __name__ == '__main__':
+    main()
