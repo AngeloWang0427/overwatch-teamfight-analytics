@@ -1,0 +1,3 @@
+match_id,fight_id,map_name,ult_diff,first_pick,fight_won,fight_duration,data_source,confidence,notes
+UT_001,1,Ilios,0,Unknown,0,30,replay,medium,"Converted from earlier raw annotation; first pick not confirmed"
+UT_001,2,Ilios,0,Unknown,1,19,replay,medium,"Converted from earlier raw annotation; first pick not confirmed"
